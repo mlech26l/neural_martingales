@@ -1,4 +1,4 @@
-# Supplementary code for the paper Learning Control Policies for Stochastic Systems with Reach-avoid Guarantees
+# Learning Control Policies for Region Stabilization in Stochastic Systems
 
 ## Requirements
 
@@ -27,34 +27,30 @@ The ```checkpoints``` directory contains the pre-trained policies used in the ex
 
 - ```lds_100_ppo.jax```
 - ```pend_100_ppo.jax```
-- ```cavoid_100_ppo.jax```
-- ```lds_20_ppo.jax```
-- ```pend_20_ppo.jax```
-- ```cavoid_20_ppo.jax```
 
 
-## Learning a RASM
+## Learning a sRASM
 
 ```bash
-python3 rsm_loop.py --env lds_100 --skip_ppo --p_lip 4.0 --grid_factor 8 --batch_size 2048 --reach_prob 0.8
-python3 rsm_loop.py --env cavoid_20_ppo --skip_ppo --p_lip 4.0 --grid_factor 8 --batch_size 2048 --reach_prob 0.9
-python3 rsm_loop.py --env pend_100 --skip_ppo --grid_factor 16 --batch_size 2048  --fail_check_fast 1 --jitter_grid 1 --reach_prob 0.8
+python3 rsm_loop.py --skip_ppo --env lds_100 --p_lip 4.0 --grid_factor 4 --batch_size 4*2048 --stability_check
+python3 rsm_loop.py --skip_ppo --env pend_100 --p_lip 4.0 --grid_factor 4 --batch_size 4*2048 --stability_check --epsilon_as_tau --eps 0.003
 ```
 
-To learn a RASM with only the decrease condition (=RSM), run 
+To learn a sRASM with fixing epsilon for the loss function, run 
 
 ```bash
-python3 rsm_loop.py --env lds_100 --skip_ppo --p_lip 4.0 --grid_factor 8 --batch_size 2048 --reach_prob 1.0
+python3 rsm_loop.py --skip_ppo --env lds_100 --p_lip 4.0 --grid_factor 4 --batch_size 4*2048 --stability_check
 ```
 
-To learn only the RASM network and fix the policy, run 
+To learn a sRASM and use (K * tau) instead of epsilon in the loss function (L'_{cond 2} in the Supplementary Material), run 
 
 ```bash
-python3 rsm_loop.py --env lds_100 --skip_ppo --p_lip 4.0 --grid_factor 8 --batch_size 2048 --reach_prob 0.8 --train_p 0
+python3 rsm_loop.py --skip_ppo --env lds_100 --p_lip 4.0 --grid_factor 4 --batch_size 4*2048 --stability_check --epsilon_as_tau --eps 0.0007
 ```
 
+In the above for the parameter --eps, you should pass the mesh value that you use in the discretization.
 
 ## Note on the obtained bounds
 
-After the conditions are checked by the verifier module, the RASM network is normalized such that the sup. of V at the initial set is 1 and the inf. of V on the entire domain is 0. 
-This normalization allows us to obtain even slightly better bounds than the verifier concluded (see Appendix F in the paper).
+After the conditions are checked by the verifier module, the sRASM network is normalized such that the inf. of V on the entire domain is 0. 
+This normalization allows us to obtain even slightly better bounds than the verifier concluded.

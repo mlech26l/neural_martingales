@@ -11,56 +11,113 @@ import tensorflow as tf
 import jax.numpy as jnp
 from tqdm.auto import tqdm
 
-from rsm_utils import lipschitz_l1_jax, pretty_time, jax_save
+from rsm_utils import lipschitz_l1_jax, pretty_time, jax_save, plot_policy
 
 
 class ExperienceBuffer:
     def __init__(self):
+        self.gamma = 0.99
+        self.ep_states = []
+        self.ep_action_sampled = []
+        self.ep_action_log_prob = []
+        self.ep_rewards = []
+        self.ep_dones = []
         self.action_sampled = []
+        self.action_log_prob = []
         self.states = []
         self.returns = []
-        self.action_log_prob = []
+        self.episode_total_returns = []
         self.advantage = None
+        self._ds_seed = 0
 
-    def close_episode(self, returns):
-        self.returns.extend(returns)
+    def get_ds_seed(self):
+        self._ds_seed += 1
+        return self._ds_seed
 
-    def append(self, state, sampled_action, log_prob):
-        self.states.append(state)
-        self.action_sampled.append(sampled_action)
-        self.action_log_prob.append(log_prob)
+    def close_episodes(self):
+        batch_size = self.ep_states[0].shape[0]
+
+        returns = []
+        discounted_sum = jnp.zeros(batch_size)
+        episode_return = jnp.zeros(batch_size)
+        for i in range(len(self.ep_rewards) - 1, -1, -1):
+            r = self.ep_rewards[i]
+            done = self.ep_dones[i].astype(jnp.float32)
+            r = (1.0 - done) * r
+            discounted_sum = r + self.gamma * discounted_sum
+            episode_return += r
+            returns.append(discounted_sum)
+        returns.reverse()
+
+        for i in range(len(self.ep_states)):
+            active = jnp.logical_not(self.ep_dones[i])
+            states = self.ep_states[i][active]
+            action_sampled = self.ep_action_sampled[i][active]
+            action_log_prob = self.ep_action_log_prob[i][active]
+            ep_returns = returns[i][active]
+
+            self.states.append(states)
+            self.action_sampled.append(action_sampled)
+            self.action_log_prob.append(action_log_prob)
+            self.returns.append(ep_returns)
+        self.episode_total_returns.append(episode_return)
+
+    @property
+    def total_returns(self):
+        return np.stack(self.episode_total_returns).flatten()
+
+    def append(self, state, sampled_action, log_prob, reward, done):
+        self.ep_states.append(state)
+        self.ep_action_sampled.append(sampled_action)
+        self.ep_action_log_prob.append(log_prob)
+        self.ep_rewards.append(reward)
+        self.ep_dones.append(done)
 
     def clear(self):
+        self.ep_states = []
+        self.ep_action_sampled = []
+        self.ep_action_log_prob = []
+        self.ep_rewards = []
+        self.ep_dones = []
         self.action_sampled = []
         self.states = []
         self.returns = []
         self.action_log_prob = []
+        self.episode_total_returns = []
 
     def get_states(self):
-        return np.stack(self.states)
+        return np.array(jnp.concatenate(self.states, 0))
 
     def set_advantage(self, values):
-        returns = np.stack(self.returns)
+        returns = np.array(jnp.concatenate(self.returns))
         advantage = returns - np.array(values)
         mean, std = np.mean(advantage), np.std(advantage)
         advantage = (advantage - mean) / (std + 1e-6)
         self.advantage = advantage
 
     def get_value_train_iter(self, batch_size=128):
-        states = np.stack(self.states, axis=0)
-        returns = np.stack(self.returns).reshape((-1, 1))
+        states = np.array(jnp.concatenate(self.states, axis=0))
+        returns = np.array(jnp.concatenate(self.returns).reshape((-1, 1)))
         train_ds = tf.data.Dataset.from_tensor_slices((states, returns))
-        train_ds = train_ds.shuffle(4096).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        train_ds = (
+            train_ds.shuffle(4096, seed=self.get_ds_seed())
+            .batch(batch_size)
+            .prefetch(tf.data.AUTOTUNE)
+        )
         return train_ds
 
     def get_policy_train_iter(self, batch_size=128):
-        states = np.stack(self.states, axis=0)
-        action_sampled = np.stack(self.action_sampled)
-        action_log_prob = np.stack(self.action_log_prob).flatten()
+        states = np.array(jnp.concatenate(self.states, axis=0))
+        action_sampled = np.array(jnp.concatenate(self.action_sampled, 0))
+        action_log_prob = np.array(jnp.concatenate(self.action_log_prob, 0).flatten())
         train_ds = tf.data.Dataset.from_tensor_slices(
             (states, action_sampled, action_log_prob, self.advantage)
         )
-        train_ds = train_ds.shuffle(4096).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        train_ds = (
+            train_ds.shuffle(4096, seed=self.get_ds_seed())
+            .batch(batch_size)
+            .prefetch(tf.data.AUTOTUNE)
+        )
         return train_ds
 
 
@@ -82,8 +139,9 @@ def gauss_log_prob(mean, std, x):
     return -1 / (2 * jnp.square(std)) * jnp.sum(jnp.square(mean - x), axis=-1)
 
 
-def np_gauss_log_prob(mean, std, x):
-    return -1 / (2 * np.square(std)) * np.sum(np.square(mean - x), axis=-1)
+#
+# def np_gauss_log_prob(mean, std, x):
+#     return -1 / (2 * np.square(std)) * np.sum(np.square(mean - x), axis=-1)
 
 
 @jax.jit
@@ -119,7 +177,7 @@ def train_step_policy(
     return policy_s, metrics
 
 
-class PPO:
+class vPPO:
     def __init__(self, p_state, c_state, env, max_lip):
         self.env = env
         self.action_dim = self.env.action_space.shape[0]
@@ -132,42 +190,42 @@ class PPO:
         self.lip_factor = 0
         self.action_std = 0.2
         self.i = 0
+        self.rng = jax.random.PRNGKey(1)
         self.buffer = ExperienceBuffer()
+
+        self._best_r = None
+        self._best_pc_states = None
 
     def clear_history(self):
         self.buffer.clear()
 
-    def sample_rollout(self):
+    def get_rng_keys(self, n):
+        self.rng, rng = jax.random.split(self.rng)
+        if n > 1:
+            rng = jax.random.split(rng, n)
+        return rng
+
+    def sample_rollouts(self, batch_size=256):
         # state = self.env.observation_space.sample()
         # self.env.reset(state)
-        state = self.env.reset()
-        rewards_history = []
-        done = False
-        while not done:
-            action_mean = np.array(self.p_state.apply_fn(self.p_state.params, state))
+        rng = self.get_rng_keys(batch_size)
+        state, obs = self.env.v_reset(rng)
+        done = jnp.zeros(batch_size, dtype=jnp.bool_)
+        while not jnp.any(done):
+            action_mean = self.p_state.apply_fn(self.p_state.params, obs)
+            rng = self.get_rng_keys(1)
             action = (
-                np.random.default_rng().normal(size=self.action_dim) * self.action_std
+                jax.random.normal(rng, shape=(batch_size, self.action_dim))
+                * self.action_std
                 + action_mean
             )
-            log_prob = np_gauss_log_prob(action_mean, self.action_std, action)
-            self.buffer.append(
-                state,
-                action,
-                log_prob,
-            )
-            next_state, reward, done, _ = self.env.step(action)
-            rewards_history.append(reward)
-            state = next_state
-        episode_return = np.sum(rewards_history)
-        returns = []
-        discounted_sum = 0
-        for r in rewards_history[::-1]:
-            discounted_sum = r + self.gamma * discounted_sum
-            returns.append(discounted_sum)
-        returns.reverse()
-        self.buffer.close_episode(returns)
-
-        return episode_return
+            log_prob = gauss_log_prob(action_mean, self.action_std, action)
+            rng = self.get_rng_keys(batch_size)
+            state, new_obs, reward, new_done = self.env.v_step(state, action, rng)
+            self.buffer.append(obs, action, log_prob, reward, done)
+            obs = new_obs
+            done = new_done
+        self.buffer.close_episodes()
 
     def run(self, num_iters, std_start, std_end, lip_start, lip_end, save_every):
         stds = jnp.linspace(std_start, std_end, num_iters)
@@ -175,11 +233,35 @@ class PPO:
         for i in range(num_iters):
             self.action_std = stds[i]
             self.lip_factor = lip[i]
-            r = self.run_iter()
+            rs = self.run_iter()
             if save_every is not None and i % save_every == 0:
                 filename = f"checkpoints/{self.env.name}_{i:d}_ppo.jax"
                 self.save(filename)
                 print(f"SAVED at {filename}")
+            # if i % 5 == 0:
+            #     if self._best_r is None or float(jnp.mean(rs)) >= self._best_r:
+            #         print("New best policy params")
+            #         self._best_r = float(jnp.mean(rs))
+            #         self._best_pc_states = (self.p_state, self.c_state)
+            #     else:
+            #         print("Revert to old policy")
+            #         self.p_state, self.c_state = self._best_pc_states
+
+            if i % 10 == 0:
+                os.makedirs("plots_ppo", exist_ok=True)
+                filename = f"plots_ppo/{self.env.name}_{i:03d}.png"
+                plot_policy(
+                    self.env,
+                    self.p_state,
+                    filename,
+                )
+        os.makedirs("plots_ppo", exist_ok=True)
+        filename = f"plots_ppo/{self.env.name}_{num_iters:03d}.png"
+        plot_policy(
+            self.env,
+            self.p_state,
+            filename,
+        )
 
     def save(self, filename):
         jax_save(
@@ -189,7 +271,9 @@ class PPO:
 
     def run_iter(self):
         start_time = time.time()
-        rs = [self.sample_rollout() for i in range(30)]
+        for i in range(3):
+            self.sample_rollouts()
+        rs = self.buffer.total_returns
         p_lip = lipschitz_l1_jax(self.p_state.params)
         print(
             f"Iter {self.i} R={np.mean(rs):0.2f} [{np.min(rs):0.2f}, {np.max(rs):0.2f}] with lip = {p_lip:0.3f} (rollouts took {pretty_time(time.time()-start_time)})",
@@ -198,7 +282,7 @@ class PPO:
         self.train_epoch()
         self.clear_history()
         self.i += 1
-        return np.mean(rs)
+        return rs
 
     def get_mean_return(self):
         rs = [self.sample_rollout() for i in range(10)]
